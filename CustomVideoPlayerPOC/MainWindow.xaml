@@ -110,6 +110,9 @@
                     Margin="8"
                     Maximum="100"
                     Minimum="0"
+                    IsMoveToPointEnabled="True"
+                    Thumb.DragCompleted="PositionSlider_DragCompleted"
+                    Thumb.DragStarted="PositionSlider_DragStarted"
                     ValueChanged="PositionSlider_ValueChanged" />
                 <TextBlock
                     x:Name="StatusText"

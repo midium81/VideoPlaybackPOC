@@ -71,6 +71,16 @@ namespace CustomVideoPlayerPOC.Playback
         // decode thread parked on _stateLock cannot freeze the position timer.
         private long _durationTicks;
 
+        // Where a seek asked to go, reported as the position until the first frame is decoded.
+        private long _pendingSeekTicks;
+
+        // Nominal time between frames, taken from the stream instead of a hardcoded 30 fps.
+        private double _frameIntervalMs = 1000.0 / 30.0;
+
+        // Frame presentation bookkeeping: skip presenting while the UI still owes us the last frame.
+        private int _framesSinceRender;
+        private int _renderPending;
+
         public PlaybackController(
             FFmpegIO ffio,
             GrowingFileCache cache,
@@ -99,16 +109,34 @@ namespace CustomVideoPlayerPOC.Playback
 
         public void SetRate(double rate) => Volatile.Write(ref _playbackRate, rate);
 
-        public unsafe Task SeekTimeAsync(TimeSpan ts)
+        public Task SeekTimeAsync(TimeSpan ts)
+        {
+            if (ts < TimeSpan.Zero) ts = TimeSpan.Zero;
+
+            // The decode thread can hold _stateLock for a long time while it waits for bytes to be
+            // downloaded, so never take it on the caller's (UI) thread.
+            return Task.Run(() => SeekTimeCore(ts));
+        }
+
+        private unsafe void SeekTimeCore(TimeSpan ts)
         {
             var tsScaled = (long)(ts.TotalSeconds * ffmpeg.AV_TIME_BASE);
+
+            // Report the requested position straight away: the pts is unknown until the first frame
+            // after the seek is decoded, and returning zero in the meantime makes the UI slider jump.
+            Interlocked.Exchange(ref _pendingSeekTicks, ts.Ticks);
 
             lock (_stateLock)
             {
                 if (_fmtCtx == null)
-                    return Task.CompletedTask;
+                    return;
 
-                ffmpeg.avformat_seek_file(_fmtCtx, -1, long.MinValue, tsScaled, long.MaxValue, 0);
+                // Without AVSEEK_FLAG_BACKWARD the demuxer lands on the first keyframe at or after
+                // the target, so a backward jump can end up ahead of where it started.
+                var backward = ts <= GetCurrentTime();
+                var flags = backward ? ffmpeg.AVSEEK_FLAG_BACKWARD : 0;
+
+                ffmpeg.avformat_seek_file(_fmtCtx, -1, long.MinValue, tsScaled, long.MaxValue, flags);
 
                 // A previous short read may have latched an error on the custom AVIOContext.
                 if (_fmtCtx->pb != null)
@@ -125,8 +153,6 @@ namespace CustomVideoPlayerPOC.Playback
 
                 Interlocked.Exchange(ref _lastVideoPts, ffmpeg.AV_NOPTS_VALUE);
             }
-
-            return Task.CompletedTask;
         }
 
         public async Task StepFrameAsync(bool forward = true)
@@ -147,7 +173,7 @@ namespace CustomVideoPlayerPOC.Playback
         {
             var pts = Interlocked.Read(ref _lastVideoPts);
             if (pts == ffmpeg.AV_NOPTS_VALUE)
-                return TimeSpan.Zero;
+                return TimeSpan.FromTicks(Interlocked.Read(ref _pendingSeekTicks));
 
             var tb = _videoTimeBase;
             if (tb.den == 0)
@@ -202,6 +228,8 @@ namespace CustomVideoPlayerPOC.Playback
 
                 var outBufferSize = _targetWidth * _targetHeight * 3;
                 outBuffer = (byte*)ffmpeg.av_malloc((ulong)outBufferSize);
+
+                var frameClock = System.Diagnostics.Stopwatch.StartNew();
 
                 while (!ct.IsCancellationRequested)
                 {
@@ -262,9 +290,15 @@ namespace CustomVideoPlayerPOC.Playback
 
                     ffmpeg.av_packet_unref(pkt);
 
+                    // Pace playback on the stream's own frame interval. Dividing by the rate is what
+                    // makes 2x/4x actually faster; the old code only slept when rate <= 1, so the
+                    // faster rates were bounded by whatever the render path could sustain.
                     var rate = Volatile.Read(ref _playbackRate);
-                    if (rate > 0 && rate <= 1.0)
-                        Thread.Sleep((int)(1000 / 30 / rate));
+                    if (rate <= 0) rate = 1.0;
+
+                    var due = _frameIntervalMs / rate - frameClock.Elapsed.TotalMilliseconds;
+                    if (due > 1) Thread.Sleep((int)due);
+                    frameClock.Restart();
                 }
             }
             finally
@@ -315,6 +349,10 @@ namespace CustomVideoPlayerPOC.Playback
                 throw new ApplicationException("No video stream found");
 
             _videoTimeBase = _fmtCtx->streams[_videoStreamIndex]->time_base;
+
+            var fps = ffmpeg.av_guess_frame_rate(_fmtCtx, _fmtCtx->streams[_videoStreamIndex], null);
+            if (fps.num > 0 && fps.den > 0)
+                _frameIntervalMs = 1000.0 * fps.den / fps.num;
 
             if (_fmtCtx->duration > 0)
                 Interlocked.Exchange(ref _durationTicks, TimeSpan.FromSeconds((double)_fmtCtx->duration / ffmpeg.AV_TIME_BASE).Ticks);
@@ -425,26 +463,22 @@ namespace CustomVideoPlayerPOC.Playback
                     if (frame->pts != ffmpeg.AV_NOPTS_VALUE)
                         Interlocked.Exchange(ref _lastVideoPts, frame->pts);
 
-                    RenderFrame(swFrame, outBuffer, outBufferSize);
+                    // At high rates keep decoding every frame - dropping packets breaks the
+                    // reference chain - but only present every Nth one, which is what the render
+                    // path can keep up with.
+                    var rate = Volatile.Read(ref _playbackRate);
+                    var renderEvery = rate >= 2.0 ? (int)Math.Round(rate) : 1;
+
+                    if (_singleStepRequested || ++_framesSinceRender >= renderEvery)
+                    {
+                        _framesSinceRender = 0;
+                        RenderFrame(swFrame, outBuffer, outBufferSize);
+                    }
 
                     if (_singleStepRequested)
                     {
                         _singleStepRequested = false;
                         _isPlaying = false;
-                    }
-
-                    var rate = Volatile.Read(ref _playbackRate);
-                    if (rate > 1.5)
-                    {
-                        int skip = (int)(rate - 1);
-                        for (int s = 0; s < skip; s++)
-                        {
-                            lock (_stateLock)
-                            {
-                                if (ffmpeg.av_read_frame(_fmtCtx, pkt) < 0) break;
-                            }
-                            ffmpeg.av_packet_unref(pkt);
-                        }
                     }
                 }
                 finally
@@ -522,21 +556,33 @@ namespace CustomVideoPlayerPOC.Playback
             if (dispatcher == null)
                 return;
 
-            dispatcher.Invoke(() =>
+            // A blocking Invoke here throttled the whole pipeline to the UI thread and starved the
+            // downloader. Post the frame instead and skip it if the previous one is still pending.
+            if (Interlocked.CompareExchange(ref _renderPending, 1, 0) != 0)
+                return;
+
+            dispatcher.InvokeAsync(() =>
             {
-                _targetBitmap.Lock();
                 try
                 {
-                    _targetBitmap.WritePixels(
-                        new Int32Rect(0, 0, _targetWidth, _targetHeight),
-                        managed,
-                        _targetWidth * 3,
-                        0);
-                    _targetBitmap.AddDirtyRect(new Int32Rect(0, 0, _targetWidth, _targetHeight));
+                    _targetBitmap.Lock();
+                    try
+                    {
+                        _targetBitmap.WritePixels(
+                            new Int32Rect(0, 0, _targetWidth, _targetHeight),
+                            managed,
+                            _targetWidth * 3,
+                            0);
+                        _targetBitmap.AddDirtyRect(new Int32Rect(0, 0, _targetWidth, _targetHeight));
+                    }
+                    finally
+                    {
+                        _targetBitmap.Unlock();
+                    }
                 }
                 finally
                 {
-                    _targetBitmap.Unlock();
+                    Interlocked.Exchange(ref _renderPending, 0);
                 }
             });
         }

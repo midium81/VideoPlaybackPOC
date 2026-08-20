@@ -27,11 +27,39 @@ namespace CustomVideoPlayerPOC
         // Throttles UI updates so a fast download does not flood the dispatcher.
         private double _lastReportedPercent = -1;
 
+        // Distinguishes a user drag from the periodic refresh, so refreshing does not trigger a seek.
+        private bool _updatingSliderFromPlayback;
+        private bool _isScrubbing;
+        private readonly System.Windows.Threading.DispatcherTimer _positionTimer = new()
+        {
+            Interval = TimeSpan.FromMilliseconds(500)
+        };
+
         public MainWindow()
         {
             InitializeComponent();
             Loaded += MainWindow_Loaded;
             Closing += MainWindow_Closing;
+
+            _positionTimer.Tick += PositionTimer_Tick;
+        }
+
+        private void PositionTimer_Tick(object? sender, EventArgs e)
+        {
+            // Never move the thumb out from under the user while they are scrubbing.
+            if (_isScrubbing) return;
+
+            var controller = _controller;
+            if (controller == null) return;
+
+            var duration = controller.Duration;
+            if (duration <= TimeSpan.Zero) return;
+
+            var percent = Math.Clamp(controller.Position.TotalSeconds / duration.TotalSeconds * 100.0, 0, 100);
+
+            _updatingSliderFromPlayback = true;
+            try { PositionSlider.Value = percent; }
+            finally { _updatingSliderFromPlayback = false; }
         }
 
         private async void MainWindow_Loaded(object? sender, RoutedEventArgs e)
@@ -101,12 +129,21 @@ namespace CustomVideoPlayerPOC
 
                 _controller = new PlaybackController(_ffio, _cache, _downloader, _bitmap);
                 _controller.Start();
+                _positionTimer.Start();
 
                 // Hook downloader notifications to cache
                 if (_downloader != null)
                 {
                     var cache = _cache;
-                    _ = _downloader.StartPrefetchLoopAsync(() => 0, (r) => cache.NotifyRangeAvailable(r), _cts.Token);
+                    var controller = _controller;
+                    var total = _downloader.Metadata.ContentLength;
+
+                    // Prefetch ahead of where playback actually is, so a seek pulls the bytes it
+                    // needs instead of always refilling the window at offset 0.
+                    _ = Task.Run(() => _downloader.StartPrefetchLoopAsync(
+                        () => controller.GetPlaybackByteOffset(total),
+                        r => cache.NotifyRangeAvailable(r),
+                        _cts.Token), _cts.Token);
                 }
             }
             catch (Exception ex)
@@ -238,10 +275,69 @@ namespace CustomVideoPlayerPOC
         private void BtnPlay_Click(object sender, RoutedEventArgs e) => _controller?.Play();
         private void BtnPause_Click(object sender, RoutedEventArgs e) => _controller?.Pause();
         private async void BtnStep_Click(object sender, RoutedEventArgs e) { if (_controller != null) await _controller.StepFrameAsync(true); }
-        private async void BtnSeek10_Click(object sender, RoutedEventArgs e) { if (_controller != null) await _controller.SeekTimeAsync(TimeSpan.FromSeconds(10)); }
+        private async void BtnSeek10_Click(object sender, RoutedEventArgs e)
+        {
+            if (_controller != null)
+                await _controller.SeekTimeAsync(_controller.Position + TimeSpan.FromSeconds(10));
+        }
+
         private void BtnFF2_Click(object sender, RoutedEventArgs e) { _controller?.SetRate(2.0); }
         private void BtnFF4_Click(object sender, RoutedEventArgs e) { _controller?.SetRate(4.0); }
-        private void PositionSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { /* map slider to seek if desired */ }
+
+        private void PositionSlider_DragStarted(object sender, System.Windows.Controls.Primitives.DragStartedEventArgs e)
+            => _isScrubbing = true;
+
+        private async void PositionSlider_DragCompleted(object sender, System.Windows.Controls.Primitives.DragCompletedEventArgs e)
+        {
+            _isScrubbing = false;
+            await SeekToPercentAsync(PositionSlider.Value);
+        }
+
+        private async void PositionSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            // Ignore the periodic refresh, and let a drag settle: seeking on every intermediate
+            // value flooded the decoder with seeks and made the thumb fight the refresh timer.
+            if (_updatingSliderFromPlayback || _isScrubbing) return;
+
+            await SeekToPercentAsync(e.NewValue);
+        }
+
+        private async Task SeekToPercentAsync(double percent)
+        {
+            var controller = _controller;
+            if (controller == null) return;
+
+            var duration = controller.Duration;
+            if (duration <= TimeSpan.Zero) return;
+
+            var target = TimeSpan.FromSeconds(duration.TotalSeconds * percent / 100.0);
+
+            // Pull the bytes around the seek target first, otherwise the demuxer parks waiting for
+            // a region the sequential prefetcher has not reached yet.
+            if (_downloader != null)
+            {
+                var total = _downloader.Metadata.ContentLength;
+                if (total > 0)
+                {
+                    var start = Math.Clamp((long)(total * percent / 100.0), 0, Math.Max(0, total - 1));
+                    var end = Math.Min(total - 1, start + 2 * 1024 * 1024);
+                    var cache = _cache;
+                    var downloader = _downloader;
+
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await downloader.RequestPriorityRangeAsync(start, end, _cts.Token).ConfigureAwait(false);
+                            cache?.NotifyRangeAvailable(new ByteRange(start, end));
+                        }
+                        catch { /* the prefetch loop will pick this range up again */ }
+                    }, _cts.Token);
+                }
+            }
+
+            await controller.SeekTimeAsync(target);
+        }
 
         private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
@@ -250,6 +346,7 @@ namespace CustomVideoPlayerPOC
 
         private void TeardownPlayback()
         {
+            _positionTimer.Stop();
             _cts.Cancel();
 
             if (_downloader != null)
