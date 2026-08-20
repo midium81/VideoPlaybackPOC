@@ -81,6 +81,23 @@ namespace CustomVideoPlayerPOC.Playback
         private int _framesSinceRender;
         private int _renderPending;
 
+        // ----- Reverse playback -----
+        // Decoders only run forwards, so playing backwards means repeatedly decoding a window that
+        // ends at the current position and presenting the frames of that window in reverse order.
+        // The window is bounded so the buffered BGR24 frames cannot grow without limit.
+        private const int MaxReverseFrames = 24;
+
+        private readonly List<byte[]> _reverseFrames = new(MaxReverseFrames);
+        private readonly List<long> _reversePts = new(MaxReverseFrames);
+        private int _reverseCursor = -1;
+        private long _reverseAnchorPts = ffmpeg.AV_NOPTS_VALUE;
+
+        // Direction the decode loop last ran in, so a direction change can reset the pipeline.
+        private bool _lastLoopWasReverse;
+
+        // Raised by a seek on another thread; honoured by the decode thread, which owns the lists.
+        private volatile bool _reverseInvalidated;
+
         public PlaybackController(
             FFmpegIO ffio,
             GrowingFileCache cache,
@@ -107,7 +124,41 @@ namespace CustomVideoPlayerPOC.Playback
 
         public void Pause() => _isPlaying = false;
 
+        /// <summary>
+        /// Playback speed. A negative value plays backwards, e.g. -1 for reverse at normal speed
+        /// and -4 for reverse at 4x.
+        /// </summary>
         public void SetRate(double rate) => Volatile.Write(ref _playbackRate, rate);
+
+        /// <summary>True while the controller is playing backwards.</summary>
+        public bool IsReverse => Volatile.Read(ref _playbackRate) < 0;
+
+        /// <summary>Starts (or continues) playing backwards, keeping the current speed magnitude.</summary>
+        public void PlayBackward()
+        {
+            var speed = Math.Abs(Volatile.Read(ref _playbackRate));
+            if (speed <= 0) speed = 1.0;
+
+            SetRate(-speed);
+            _isPlaying = true;
+        }
+
+        /// <summary>Starts (or continues) playing forwards, keeping the current speed magnitude.</summary>
+        public void PlayForward()
+        {
+            var speed = Math.Abs(Volatile.Read(ref _playbackRate));
+            if (speed <= 0) speed = 1.0;
+
+            SetRate(speed);
+            _isPlaying = true;
+        }
+
+        /// <summary>Changes the speed magnitude without changing the current direction.</summary>
+        public void SetSpeed(double speed)
+        {
+            speed = Math.Abs(speed);
+            SetRate(IsReverse ? -speed : speed);
+        }
 
         public Task SeekTimeAsync(TimeSpan ts)
         {
@@ -125,6 +176,13 @@ namespace CustomVideoPlayerPOC.Playback
             // Report the requested position straight away: the pts is unknown until the first frame
             // after the seek is decoded, and returning zero in the meantime makes the UI slider jump.
             Interlocked.Exchange(ref _pendingSeekTicks, ts.Ticks);
+
+            // The decode thread may currently be parked inside av_read_frame while holding
+            // _stateLock, waiting for bytes from a *previous* position that have not downloaded yet.
+            // Without this, a new seek issued while that wait is still in progress would block on
+            // the lock indefinitely instead of landing on the new spot - release it here so this
+            // seek is not stuck behind a stale one.
+            _ffio.InterruptPendingRead();
 
             lock (_stateLock)
             {
@@ -152,21 +210,34 @@ namespace CustomVideoPlayerPOC.Playback
                     ffmpeg.avcodec_flush_buffers(_audioDecCtx);
 
                 Interlocked.Exchange(ref _lastVideoPts, ffmpeg.AV_NOPTS_VALUE);
+
+                // Frames buffered for reverse playback belong to the old position. The lists are
+                // owned by the decode thread, so only raise a flag here and let it do the clearing.
+                _reverseInvalidated = true;
             }
         }
 
-        public async Task StepFrameAsync(bool forward = true)
+        private void InvalidateReverseBuffer()
         {
-            if (!forward)
-            {
-                var target = GetCurrentTime() - TimeSpan.FromSeconds(2);
-                if (target < TimeSpan.Zero) target = TimeSpan.Zero;
+            _reverseFrames.Clear();
+            _reversePts.Clear();
+            _reverseCursor = -1;
+            _reverseAnchorPts = ffmpeg.AV_NOPTS_VALUE;
+            _reverseInvalidated = false;
+        }
 
-                await SeekTimeAsync(target).ConfigureAwait(false);
-            }
+        /// <summary>
+        /// Presents exactly one more frame and pauses. Stepping backwards uses the reverse frame
+        /// window, so it lands on the true previous frame rather than on the previous keyframe.
+        /// </summary>
+        public Task StepFrameAsync(bool forward = true)
+        {
+            SetRate(forward ? Math.Abs(Volatile.Read(ref _playbackRate)) : -Math.Abs(Volatile.Read(ref _playbackRate)));
 
             _isPlaying = false;
             _singleStepRequested = true;
+
+            return Task.CompletedTask;
         }
 
         private TimeSpan GetCurrentTime()
@@ -239,6 +310,51 @@ namespace CustomVideoPlayerPOC.Playback
                         continue;
                     }
 
+                    var rate = Volatile.Read(ref _playbackRate);
+                    if (rate == 0) rate = 1.0;
+
+                    var reverse = rate < 0;
+                    var speed = Math.Abs(rate);
+
+                    // Switching direction leaves the demuxer positioned for the old direction.
+                    if (reverse != _lastLoopWasReverse)
+                    {
+                        _lastLoopWasReverse = reverse;
+
+                        if (!reverse)
+                        {
+                            // Resume forward decoding from wherever reverse playback stopped.
+                            SeekTimeCore(GetCurrentTime());
+                        }
+                        else
+                        {
+                            InvalidateReverseBuffer();
+                        }
+                    }
+
+                    if (reverse)
+                    {
+                        if (_reverseInvalidated)
+                            InvalidateReverseBuffer();
+
+                        if (!StepReverse(frame, pkt, outBuffer, outBufferSize, speed, ct))
+                        {
+                            // Start of the media reached: stop rather than spin.
+                            _isPlaying = false;
+                            _singleStepRequested = false;
+                            continue;
+                        }
+
+                        if (_singleStepRequested)
+                        {
+                            _singleStepRequested = false;
+                            _isPlaying = false;
+                        }
+
+                        PaceFrame(frameClock, speed);
+                        continue;
+                    }
+
                     int ret;
                     lock (_stateLock)
                     {
@@ -276,7 +392,7 @@ namespace CustomVideoPlayerPOC.Playback
                     {
                         ProcessVideoPacket(pkt, frame, outBuffer, outBufferSize, ct);
                     }
-                    else if (pkt->stream_index == _audioStreamIndex && _audioDecCtx != null)
+                    else if (pkt->stream_index == _audioStreamIndex && _audioDecCtx != null && speed <= 1.0)
                     {
                         if (ffmpeg.avcodec_send_packet(_audioDecCtx, pkt) == 0)
                         {
@@ -290,15 +406,9 @@ namespace CustomVideoPlayerPOC.Playback
 
                     ffmpeg.av_packet_unref(pkt);
 
-                    // Pace playback on the stream's own frame interval. Dividing by the rate is what
-                    // makes 2x/4x actually faster; the old code only slept when rate <= 1, so the
-                    // faster rates were bounded by whatever the render path could sustain.
-                    var rate = Volatile.Read(ref _playbackRate);
-                    if (rate <= 0) rate = 1.0;
-
-                    var due = _frameIntervalMs / rate - frameClock.Elapsed.TotalMilliseconds;
-                    if (due > 1) Thread.Sleep((int)due);
-                    frameClock.Restart();
+                    // Pace playback on the stream's own frame interval. Dividing by the speed is
+                    // what makes 2x/4x actually faster.
+                    PaceFrame(frameClock, speed);
                 }
             }
             finally
@@ -430,6 +540,165 @@ namespace CustomVideoPlayerPOC.Playback
             return pixFmts != null ? *pixFmts : AVPixelFormat.AV_PIX_FMT_NONE;
         }
 
+        private void PaceFrame(System.Diagnostics.Stopwatch clock, double speed)
+        {
+            if (speed <= 0) speed = 1.0;
+
+            var due = _frameIntervalMs / speed - clock.Elapsed.TotalMilliseconds;
+            if (due > 1) Thread.Sleep((int)due);
+            clock.Restart();
+        }
+
+        /// <summary>
+        /// Presents the next frame going backwards. Returns false once the start of the media is
+        /// reached and there is nothing left to show.
+        /// </summary>
+        private unsafe bool StepReverse(AVFrame* frame, AVPacket* pkt, byte* outBuffer, int outBufferSize, double speed, CancellationToken ct)
+        {
+            if (_reverseCursor < 0 && !FillReverseWindow(frame, pkt, outBuffer, outBufferSize, ct))
+                return false;
+
+            if (_reverseCursor < 0 || _reverseCursor >= _reverseFrames.Count)
+                return false;
+
+            Interlocked.Exchange(ref _lastVideoPts, _reversePts[_reverseCursor]);
+            PresentFrame(_reverseFrames[_reverseCursor]);
+
+            // At higher speeds show every Nth buffered frame instead of decoding less accurately.
+            var stride = speed >= 2.0 ? (int)Math.Round(speed) : 1;
+            _reverseCursor -= _singleStepRequested ? 1 : stride;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Decodes the window of frames immediately before the current position and keeps the last
+        /// <see cref="MaxReverseFrames"/> of them, so they can be presented newest-first.
+        /// </summary>
+        private unsafe bool FillReverseWindow(AVFrame* frame, AVPacket* pkt, byte* outBuffer, int outBufferSize, CancellationToken ct)
+        {
+            _reverseFrames.Clear();
+            _reversePts.Clear();
+            _reverseCursor = -1;
+
+            var tb = _videoTimeBase;
+            if (tb.den == 0) return false;
+
+            var anchorTime = _reverseAnchorPts == ffmpeg.AV_NOPTS_VALUE
+                ? GetCurrentTime()
+                : TimeSpan.FromSeconds(_reverseAnchorPts * ffmpeg.av_q2d(tb));
+
+            if (anchorTime <= TimeSpan.Zero) return false;
+
+            // Decode a window slightly larger than what we keep, so the seek lands on a keyframe
+            // early enough for the frames we actually want to be reconstructable.
+            var windowMs = _frameIntervalMs * MaxReverseFrames;
+            var startTime = anchorTime - TimeSpan.FromMilliseconds(windowMs);
+            if (startTime < TimeSpan.Zero) startTime = TimeSpan.Zero;
+
+            var anchorPts = _reverseAnchorPts == ffmpeg.AV_NOPTS_VALUE
+                ? (long)(anchorTime.TotalSeconds / ffmpeg.av_q2d(tb))
+                : _reverseAnchorPts;
+
+            SeekTimeCore(startTime);
+
+            // SeekTimeCore flags the window as stale; it is being rebuilt right now.
+            _reverseInvalidated = false;
+            _reverseAnchorPts = anchorPts;
+            Interlocked.Exchange(ref _pendingSeekTicks, anchorTime.Ticks);
+
+            while (!ct.IsCancellationRequested)
+            {
+                int ret;
+                lock (_stateLock)
+                {
+                    ret = ffmpeg.av_read_frame(_fmtCtx, pkt);
+                }
+
+                if (ret < 0)
+                {
+                    ffmpeg.av_packet_unref(pkt);
+                    break;
+                }
+
+                if (pkt->stream_index != _videoStreamIndex)
+                {
+                    ffmpeg.av_packet_unref(pkt);
+                    continue;
+                }
+
+                var sent = ffmpeg.avcodec_send_packet(_videoDecCtx, pkt);
+                ffmpeg.av_packet_unref(pkt);
+                if (sent != 0) continue;
+
+                var reachedAnchor = false;
+
+                while (ffmpeg.avcodec_receive_frame(_videoDecCtx, frame) == 0)
+                {
+                    AVFrame* swFrame = frame;
+                    AVFrame* tmpFrame = null;
+
+                    try
+                    {
+                        if (frame->format == (int)AVPixelFormat.AV_PIX_FMT_D3D11 ||
+                            frame->format == (int)AVPixelFormat.AV_PIX_FMT_DXVA2_VLD)
+                        {
+                            tmpFrame = ffmpeg.av_frame_alloc();
+                            if (ffmpeg.av_hwframe_transfer_data(tmpFrame, frame, 0) < 0)
+                            {
+                                ffmpeg.av_frame_free(&tmpFrame);
+                                tmpFrame = null;
+                            }
+                            else
+                            {
+                                swFrame = tmpFrame;
+                            }
+                        }
+
+                        var pts = frame->pts;
+                        if (pts == ffmpeg.AV_NOPTS_VALUE) continue;
+
+                        if (pts >= anchorPts)
+                        {
+                            reachedAnchor = true;
+                            continue;
+                        }
+
+                        var pixels = ScaleFrame(swFrame, outBuffer, outBufferSize);
+                        if (pixels == null) continue;
+
+                        _reverseFrames.Add(pixels);
+                        _reversePts.Add(pts);
+
+                        // Keep only the newest frames of the window.
+                        if (_reverseFrames.Count > MaxReverseFrames)
+                        {
+                            _reverseFrames.RemoveAt(0);
+                            _reversePts.RemoveAt(0);
+                        }
+                    }
+                    finally
+                    {
+                        if (tmpFrame != null)
+                            ffmpeg.av_frame_free(&tmpFrame);
+
+                        ffmpeg.av_frame_unref(frame);
+                    }
+                }
+
+                if (reachedAnchor) break;
+            }
+
+            if (_reverseFrames.Count == 0)
+                return false;
+
+            // Next window ends where this one starts.
+            _reverseAnchorPts = _reversePts[0];
+            _reverseCursor = _reverseFrames.Count - 1;
+
+            return true;
+        }
+
         private unsafe void ProcessVideoPacket(AVPacket* pkt, AVFrame* frame, byte* outBuffer, int outBufferSize, CancellationToken ct)
         {
             if (ffmpeg.avcodec_send_packet(_videoDecCtx, pkt) != 0)
@@ -493,6 +762,14 @@ namespace CustomVideoPlayerPOC.Playback
 
         private unsafe void RenderFrame(AVFrame* swFrame, byte* outBuffer, int outBufferSize)
         {
+            var pixels = ScaleFrame(swFrame, outBuffer, outBufferSize);
+            if (pixels != null)
+                PresentFrame(pixels);
+        }
+
+        /// <summary>Scales a decoded frame into a fresh BGR24 buffer sized for the target bitmap.</summary>
+        private unsafe byte[]? ScaleFrame(AVFrame* swFrame, byte* outBuffer, int outBufferSize)
+        {
             var srcFmt = (AVPixelFormat)swFrame->format;
 
             // Reuse the scaler unless the source geometry/format changed.
@@ -519,7 +796,7 @@ namespace CustomVideoPlayerPOC.Playback
             }
 
             if (_swsCtx == null)
-                return;
+                return null;
 
             var dstData = new byte_ptrArray4();
             var dstLines = new int_array4();
@@ -552,6 +829,12 @@ namespace CustomVideoPlayerPOC.Playback
             var managed = new byte[outBufferSize];
             Marshal.Copy((IntPtr)outBuffer, managed, 0, outBufferSize);
 
+            return managed;
+        }
+
+        /// <summary>Hands a scaled BGR24 buffer to the UI thread for display.</summary>
+        private void PresentFrame(byte[] managed)
+        {
             var dispatcher = Application.Current?.Dispatcher;
             if (dispatcher == null)
                 return;

@@ -22,7 +22,7 @@ namespace CustomVideoPlayerPOC.Core
         /// <summary>Folder where downloaded videos are retained across runs.</summary>
         public string RetentionFolder { get; set; } = DefaultRetentionFolder;
 
-        public string VideoUrl { get; set; } = "https://cdn.mzeeshan.me/assets/Large_1920_1080_1080p_FHD_157_2_MB_5429a568b3.mp4";
+        public string VideoUrl { get; set; } = "https://vod.performgroup.com/transcoded/20260816/1gaqq27f7ppuk157fays68j8ju-1_1724.mp4";
 
         public static AppSettings Load()
         {

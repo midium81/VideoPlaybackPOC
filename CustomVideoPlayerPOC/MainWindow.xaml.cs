@@ -272,17 +272,32 @@ namespace CustomVideoPlayerPOC
             return -1;
         }
 
-        private void BtnPlay_Click(object sender, RoutedEventArgs e) => _controller?.Play();
+        private void BtnPlay_Click(object sender, RoutedEventArgs e) => _controller?.PlayForward();
+        private void BtnPlayBackward_Click(object sender, RoutedEventArgs e) => _controller?.PlayBackward();
         private void BtnPause_Click(object sender, RoutedEventArgs e) => _controller?.Pause();
         private async void BtnStep_Click(object sender, RoutedEventArgs e) { if (_controller != null) await _controller.StepFrameAsync(true); }
+        private async void BtnStepBack_Click(object sender, RoutedEventArgs e) { if (_controller != null) await _controller.StepFrameAsync(false); }
         private async void BtnSeek10_Click(object sender, RoutedEventArgs e)
         {
             if (_controller != null)
                 await _controller.SeekTimeAsync(_controller.Position + TimeSpan.FromSeconds(10));
         }
 
+        private void BtnNormal_Click(object sender, RoutedEventArgs e) { _controller?.SetSpeed(1.0); }
         private void BtnFF2_Click(object sender, RoutedEventArgs e) { _controller?.SetRate(2.0); }
         private void BtnFF4_Click(object sender, RoutedEventArgs e) { _controller?.SetRate(4.0); }
+
+        private void BtnRew2_Click(object sender, RoutedEventArgs e)
+        {
+            _controller?.SetRate(-2.0);
+            _controller?.Play();
+        }
+
+        private void BtnRew4_Click(object sender, RoutedEventArgs e)
+        {
+            _controller?.SetRate(-4.0);
+            _controller?.Play();
+        }
 
         private void PositionSlider_DragStarted(object sender, System.Windows.Controls.Primitives.DragStartedEventArgs e)
             => _isScrubbing = true;
@@ -312,15 +327,23 @@ namespace CustomVideoPlayerPOC
 
             var target = TimeSpan.FromSeconds(duration.TotalSeconds * percent / 100.0);
 
-            // Pull the bytes around the seek target first, otherwise the demuxer parks waiting for
-            // a region the sequential prefetcher has not reached yet.
+            // Pull the bytes around the seek target with priority, using several parallel chunk
+            // requests so the margin fills quickly. This is fire-and-forget: the seek itself is
+            // issued right away so playback resumes from the new spot as soon as the first bytes it
+            // actually needs arrive (FFmpegIO.ReadPacket parks and retries for those), instead of the
+            // whole UI action waiting for a multi-megabyte range to land first. A margin is fetched
+            // *before* the target too: the target byte offset is only a rough estimate, and a
+            // backward seek (AVSEEK_FLAG_BACKWARD) lands the demuxer on the nearest keyframe at or
+            // before it.
             if (_downloader != null)
             {
                 var total = _downloader.Metadata.ContentLength;
                 if (total > 0)
                 {
-                    var start = Math.Clamp((long)(total * percent / 100.0), 0, Math.Max(0, total - 1));
-                    var end = Math.Min(total - 1, start + 2 * 1024 * 1024);
+                    const long margin = 4 * 1024 * 1024;
+                    var center = Math.Clamp((long)(total * percent / 100.0), 0, Math.Max(0, total - 1));
+                    var start = Math.Max(0, center - margin);
+                    var end = Math.Min(total - 1, center + margin);
                     var cache = _cache;
                     var downloader = _downloader;
 
@@ -328,10 +351,11 @@ namespace CustomVideoPlayerPOC
                     {
                         try
                         {
-                            await downloader.RequestPriorityRangeAsync(start, end, _cts.Token).ConfigureAwait(false);
-                            cache?.NotifyRangeAvailable(new ByteRange(start, end));
+                            await downloader.RequestPriorityRangeAsync(
+                                start, end, _cts.Token,
+                                onChunkDownloaded: chunk => cache?.NotifyRangeAvailable(chunk)).ConfigureAwait(false);
                         }
-                        catch { /* the prefetch loop will pick this range up again */ }
+                        catch { /* the sequential prefetch loop will pick this range up again */ }
                     }, _cts.Token);
                 }
             }

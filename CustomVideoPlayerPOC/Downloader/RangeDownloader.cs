@@ -285,10 +285,51 @@ namespace CustomVideoPlayerPOC.Downloader
             return chunks;
         }
 
-        // Request a specific high-priority range (used for seeks and moov-tail fetch)
-        public async Task RequestPriorityRangeAsync(long start, long end, CancellationToken ct = default)
+        /// <summary>
+        /// Fetches a specific high-priority range (used for seeks and moov-tail fetch). The range is
+        /// split into chunk-sized pieces downloaded in parallel (bounded by <see cref="MaxParallelChunks"/>)
+        /// instead of one long sequential request, so the first bytes the demuxer needs land quickly and
+        /// the whole margin fills faster on high-latency/high-bandwidth connections.
+        /// </summary>
+        /// <param name="onChunkDownloaded">
+        /// Invoked on a background thread as soon as each chunk lands, so callers can unblock reads
+        /// waiting on that sub-range instead of waiting for the entire requested range to finish.
+        /// </param>
+        public async Task RequestPriorityRangeAsync(long start, long end, CancellationToken ct = default, Action<ByteRange>? onChunkDownloaded = null)
         {
-            await DownloadRangeAsync(start, end, ct);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
+            ct = linked.Token;
+
+            var missing = _downloadedRanges.GetMissingRanges(start, end - start + 1).ToList();
+            if (missing.Count == 0) return;
+
+            using var gate = new SemaphoreSlim(MaxParallelChunks, MaxParallelChunks);
+            var tasks = new List<Task>();
+
+            foreach (var gap in missing)
+            {
+                for (var s = gap.Start; s <= gap.End; s += _chunkSize)
+                {
+                    var chunk = new ByteRange(s, Math.Min(s + _chunkSize - 1, gap.End));
+
+                    await gate.WaitAsync(ct).ConfigureAwait(false);
+                    tasks.Add(DownloadPriorityChunkAsync(chunk, onChunkDownloaded, gate, ct));
+                }
+            }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+
+        private async Task DownloadPriorityChunkAsync(ByteRange chunk, Action<ByteRange>? onChunkDownloaded, SemaphoreSlim gate, CancellationToken ct)
+        {
+            try
+            {
+                await DownloadRangeAsync(chunk.Start, chunk.End, ct).ConfigureAwait(false);
+                onChunkDownloaded?.Invoke(chunk);
+            }
+            catch (OperationCanceledException) { }
+            catch { /* the sequential prefetch loop will pick this range up again */ }
+            finally { gate.Release(); }
         }
 
         public void Dispose()

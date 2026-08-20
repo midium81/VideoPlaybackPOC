@@ -35,6 +35,12 @@ namespace CustomVideoPlayerPOC.FFmpeg
         // Lets Dispose() release a read that is parked waiting for bytes to be downloaded.
         private readonly CancellationTokenSource _cts = new();
 
+        // Swapped out whenever a seek starts, so a read parked waiting for bytes at the *old*
+        // position is released immediately instead of blocking the decode thread (and the
+        // _stateLock it holds) until its 5s timeout elapses - which made a fresh seek issued while
+        // a previous one was still waiting on data appear to freeze the player.
+        private CancellationTokenSource _readGateCts = new();
+
         public AVIOContext* AvioContext => _avioCtx;
 
         public FFmpegIO(GrowingFileCache cache, long fileSize)
@@ -59,6 +65,17 @@ namespace CustomVideoPlayerPOC.FFmpeg
                 new avio_alloc_context_seek_func { Pointer = Marshal.GetFunctionPointerForDelegate(_seekCallback) });
         }
 
+        /// <summary>
+        /// Releases a read that is currently parked waiting for bytes to be downloaded. Call this
+        /// before starting a new seek so a stale wait cannot keep the demux lock held forever.
+        /// </summary>
+        public void InterruptPendingRead()
+        {
+            var old = Interlocked.Exchange(ref _readGateCts, new CancellationTokenSource());
+            old.Cancel();
+            old.Dispose();
+        }
+
         private static int ReadPacket(void* opaque, byte* buf, int buf_size)
         {
             var handle = GCHandle.FromIntPtr((IntPtr)opaque);
@@ -72,17 +89,22 @@ namespace CustomVideoPlayerPOC.FFmpeg
             var wanted = (int)Math.Min(Math.Min(buf_size, self._bufferSize), self._fileSize - self._currentPos);
             if (wanted <= 0) return ffmpeg.AVERROR_EOF;
 
-            var ct = self._cts.Token;
             var timeout = TimeSpan.FromSeconds(5);
 
             // The file is still being downloaded, so a missing range is not an error: park here
             // until the downloader delivers it. Returning EAGAIN/EOF instead would be recorded
             // permanently on the AVIOContext and no further read callback would ever be issued.
-            while (!ct.IsCancellationRequested)
+            while (true)
             {
+                // Re-read the gate each iteration: InterruptPendingRead() swaps in a fresh source
+                // when a seek starts, so a stale wait for the previous position is cancelled even
+                // though this loop never sees the *disposal* token get signalled.
+                var gate = Volatile.Read(ref self._readGateCts);
+                using var linked = CancellationTokenSource.CreateLinkedTokenSource(self._cts.Token, gate.Token);
+
                 try
                 {
-                    var read = self._cache.ReadAsync(self._scratch, self._currentPos, wanted, timeout, ct)
+                    var read = self._cache.ReadAsync(self._scratch, self._currentPos, wanted, timeout, linked.Token)
                                           .GetAwaiter().GetResult();
                     if (read <= 0) return ffmpeg.AVERROR_EOF;
 
@@ -96,15 +118,18 @@ namespace CustomVideoPlayerPOC.FFmpeg
                 }
                 catch (OperationCanceledException)
                 {
+                    // Disposal: give up for good. A seek interrupt: return a short read so the
+                    // decode thread's av_read_frame call returns and releases the state lock; the
+                    // seek that is waiting on that lock will reposition us before the next read.
                     return ffmpeg.AVERROR_EOF;
                 }
                 catch
                 {
                     return ffmpeg.AVERROR_EOF;
                 }
-            }
 
-            return ffmpeg.AVERROR_EOF;
+                if (self._cts.IsCancellationRequested) return ffmpeg.AVERROR_EOF;
+            }
         }
 
         private static long Seek(void* opaque, long offset, int whence)
@@ -137,6 +162,7 @@ namespace CustomVideoPlayerPOC.FFmpeg
         {
             // Release any read parked waiting for bytes that will never arrive.
             _cts.Cancel();
+            _readGateCts.Cancel();
 
             if (_avioCtx != null)
             {
@@ -148,6 +174,7 @@ namespace CustomVideoPlayerPOC.FFmpeg
             }
             if (_thisHandle.IsAllocated) _thisHandle.Free();
             _cts.Dispose();
+            _readGateCts.Dispose();
             GC.SuppressFinalize(this);
         }
     }
