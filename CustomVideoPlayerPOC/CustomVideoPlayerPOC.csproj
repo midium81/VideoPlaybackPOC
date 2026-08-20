@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FFmpeg.AutoGen" Version="9.0.1.1" />
+    <PackageReference Include="NAudio" Version="3.0.1" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+  </ItemGroup>
+
+  <!--
+    FFmpeg.AutoGen ships bindings only - no native code. The shared x64 FFmpeg
+    libraries must sit next to the executable, because FFmpegHelper.RegisterFFmpegBinaries
+    sets ffmpeg.RootPath to AppDomain.CurrentDomain.BaseDirectory.
+
+    Drop the full set of DLLs into native\ffmpeg\x64\. Required SONAMEs are defined by
+    ffmpeg.LibraryVersionMap in FFmpeg.AutoGen 9.0.1.1:
+      avutil-61, avcodec-63, avformat-63, avdevice-63, avfilter-12, swscale-10, swresample-7
+  -->
+  <ItemGroup>
+    <!-- Drop the default None glob first, otherwise it wins and the copy metadata is ignored. -->
+    <None Remove="native\ffmpeg\x64\*.dll" />
+    <None Include="native\ffmpeg\x64\*.dll"
+          Link="%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest"
+          Visible="false" />
+  </ItemGroup>
+
+</Project>

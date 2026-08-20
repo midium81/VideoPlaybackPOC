@@ -1,0 +1,33 @@
+bin/
+obj/
+NSIS-Packager/
+*.suo
+.vs/
+.vscode/
+.cr/
+*.user
+*.cache
+.axoCover/
+.cr/
+tools/**
+!tools/packages.config
+!tools/nuget.config
+packages/
+*.user
+AppPackages/
+BundleArtifacts/
+Opta.Soccer.Setup.assets.cache
+*.xsd
+
+# used for testing cake script on visual studio code
+.vscode/
+launch.json
+
+# for updating packages.config to reference packages
+MigrationBackup/
+
+AppPackages/
+BundleArtifacts/
+*.pfx
+pr_body.md
+launchSettings.json
