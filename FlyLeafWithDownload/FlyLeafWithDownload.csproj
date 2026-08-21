@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Downloader" Version="5.9.5" />
+    <PackageReference Include="FlyleafLib" Version="3.11.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Drop the FFmpeg 7.x shared x64 binaries into the "FFmpeg" folder, they get copied next to the exe. -->
+    <None Include="FFmpeg\**" LinkBase="FFmpeg" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

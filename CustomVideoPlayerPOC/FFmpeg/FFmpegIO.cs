@@ -41,6 +41,16 @@ namespace CustomVideoPlayerPOC.FFmpeg
         // a previous one was still waiting on data appear to freeze the player.
         private CancellationTokenSource _readGateCts = new();
 
+        // While true, ReadPacket gives up (returns EOF) after a single short wait instead of
+        // retrying forever. avformat_seek_file can issue several probe reads while it searches for
+        // the target packet (e.g. binary/interpolation search on formats without a full index); if
+        // even one of those lands outside the bytes we prioritized around the seek target, patient
+        // indefinite retrying would block the seek - and the _stateLock it holds - forever, with
+        // nothing to interrupt it since no further seek is guaranteed to come along. Regular
+        // playback reads (outside a seek) keep retrying indefinitely, since those are fine to stall
+        // on while the downloader catches up.
+        private volatile bool _seekModeActive;
+
         public AVIOContext* AvioContext => _avioCtx;
 
         public FFmpegIO(GrowingFileCache cache, long fileSize)
@@ -76,6 +86,15 @@ namespace CustomVideoPlayerPOC.FFmpeg
             old.Dispose();
         }
 
+        /// <summary>
+        /// Enables or disables seek mode. While active every read that times out returns EOF
+        /// immediately instead of retrying indefinitely, so <c>avformat_seek_file</c>'s internal
+        /// probing reads (keyframe/index search) cannot block <c>_stateLock</c> forever when they
+        /// land outside the bytes that have already been downloaded.
+        /// Regular playback reads (outside a seek) still retry patiently until data arrives.
+        /// </summary>
+        public void SetSeekMode(bool active) => _seekModeActive = active;
+
         private static int ReadPacket(void* opaque, byte* buf, int buf_size)
         {
             var handle = GCHandle.FromIntPtr((IntPtr)opaque);
@@ -89,7 +108,12 @@ namespace CustomVideoPlayerPOC.FFmpeg
             var wanted = (int)Math.Min(Math.Min(buf_size, self._bufferSize), self._fileSize - self._currentPos);
             if (wanted <= 0) return ffmpeg.AVERROR_EOF;
 
-            var timeout = TimeSpan.FromSeconds(5);
+            // Seek-mode uses a much shorter per-attempt timeout. If avformat_seek_file's probe
+            // read doesn't find the bytes quickly we return EOF so the search gives up fast rather
+            // than blocking the demux lock for potentially minutes. Normal playback reads keep the
+            // full 5s window since the downloader's sequential prefetch will eventually reach them.
+            var seekMode = self._seekModeActive;
+            var timeout = seekMode ? TimeSpan.FromMilliseconds(750) : TimeSpan.FromSeconds(5);
 
             // The file is still being downloaded, so a missing range is not an error: park here
             // until the downloader delivers it. Returning EAGAIN/EOF instead would be recorded
@@ -109,18 +133,23 @@ namespace CustomVideoPlayerPOC.FFmpeg
                     if (read <= 0) return ffmpeg.AVERROR_EOF;
 
                     Marshal.Copy(self._scratch, 0, (IntPtr)buf, read);
-                    self._currentPos += read;
+                    self._currentPos += read;  
                     return read;
                 }
                 catch (TimeoutException)
                 {
-                    // Data has not arrived yet - keep waiting rather than failing the stream.
+                    // Seek mode: data for this probe position is not available yet - fail fast so
+                    // avformat_seek_file can either try a different strategy or return an error,
+                    // which lets SeekTimeCore exit the lock quickly and unblocks the player.
+                    if (self._seekModeActive) return ffmpeg.AVERROR_EOF;
+
+                    // Normal playback: keep retrying; the downloader will arrive here eventually.
                 }
                 catch (OperationCanceledException)
                 {
-                    // Disposal: give up for good. A seek interrupt: return a short read so the
-                    // decode thread's av_read_frame call returns and releases the state lock; the
-                    // seek that is waiting on that lock will reposition us before the next read.
+                    // Disposal: give up for good. A seek interrupt: return EOF so the decode
+                    // thread's av_read_frame call returns and releases the state lock; the seek
+                    // waiting on that lock will reposition _currentPos before the next read.
                     return ffmpeg.AVERROR_EOF;
                 }
                 catch

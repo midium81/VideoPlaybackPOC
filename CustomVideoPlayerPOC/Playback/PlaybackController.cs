@@ -194,7 +194,20 @@ namespace CustomVideoPlayerPOC.Playback
                 var backward = ts <= GetCurrentTime();
                 var flags = backward ? ffmpeg.AVSEEK_FLAG_BACKWARD : 0;
 
-                ffmpeg.avformat_seek_file(_fmtCtx, -1, long.MinValue, tsScaled, long.MaxValue, flags);
+                // Seek mode makes ReadPacket give up quickly when a probe read lands on bytes that
+                // have not been downloaded yet, so the seek call cannot block the lock forever if
+                // the format's internal index/keyframe search touches positions outside the range we
+                // prefetched. The seek may be imprecise if data is sparse, but the decoder will
+                // resync on the next keyframe it does find, which is always better than a hang.
+                _ffio.SetSeekMode(true);
+                try
+                {
+                    ffmpeg.avformat_seek_file(_fmtCtx, -1, long.MinValue, tsScaled, long.MaxValue, flags);
+                }
+                finally
+                {
+                    _ffio.SetSeekMode(false);
+                }
 
                 // A previous short read may have latched an error on the custom AVIOContext.
                 if (_fmtCtx->pb != null)
