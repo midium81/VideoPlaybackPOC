@@ -11,6 +11,7 @@
   <ItemGroup>
     <PackageReference Include="Downloader" Version="5.9.5" />
     <PackageReference Include="FlyleafLib" Version="3.11.1" />
+    <PackageReference Include="m3uParser.NET" Version="1.0.17" />
   </ItemGroup>
 
   <ItemGroup>

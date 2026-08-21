@@ -65,6 +65,8 @@ namespace FlyLeafWithDownload.Cache
             {
                 var path = Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.AbsolutePath : url;
                 var ext = Path.GetExtension(path);
+                if(ext.ToLower() == ".m3u8")
+                    return ".mp4"; // HLS streams are converted to mp4
                 if (!string.IsNullOrWhiteSpace(ext) && ext.Length <= 6)
                     return ext;
             }

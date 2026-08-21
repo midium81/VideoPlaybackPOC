@@ -1,10 +1,16 @@
-﻿using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Threading;
+﻿using FlyleafLib;
+using FlyleafLib.MediaPlayer;
 using FlyLeafWithDownload.Cache;
 using FlyLeafWithDownload.Download;
-using FlyleafLib;
-using FlyleafLib.MediaPlayer;
+using m3uParser;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Threading;
+using static System.Net.WebRequestMethods;
 
 namespace FlyLeafWithDownload
 {
@@ -16,7 +22,7 @@ namespace FlyLeafWithDownload
         private const long SkipTicks = 10 * TimeSpan.TicksPerSecond;
 
         private readonly VideoCache _cache = new();
-        private readonly BackgroundVideoDownloader _downloader;
+        private IDownloader _downloader;
         private readonly DispatcherTimer _uiTimer;
         private readonly Player _player;
 
@@ -33,11 +39,6 @@ namespace FlyLeafWithDownload
                 Player = { AutoPlay = true },
                 Demuxer = { BufferDuration = 30 * 1000 * (long)10000 }
             });
-
-            _downloader = new BackgroundVideoDownloader(_cache);
-            _downloader.ProgressChanged += OnDownloadProgress;
-            _downloader.Completed += OnDownloadCompleted;
-            _downloader.Failed += OnDownloadFailed;
 
             _uiTimer = new DispatcherTimer(DispatcherPriority.Render)
             {
@@ -64,14 +65,96 @@ namespace FlyLeafWithDownload
             };
         }
 
+        private static async Task<List<string>> GetActualSegmentUrlsAsync(string m3u8Url, HttpClient http)
+        {
+            var text = await http.GetStringAsync(m3u8Url);
+
+            // Get all non-empty, non-comment lines
+            var lines = text.Split('\n')
+                            .Select(l => l.Trim())
+                            .Where(l => l.Length > 0 && !l.StartsWith('#'))
+                            .ToList();
+
+            if (lines.Count == 0)
+                throw new InvalidOperationException("No valid target URLs found in the playlist.");
+
+            // Pick the first entry (or implement custom variant selection logic)
+            string targetUrl = ResolveAbsolute(m3u8Url, lines[0]);
+
+            // If the target is another playlist, recurse to fetch the media playlist
+            if (targetUrl.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase) || targetUrl.Contains(".m3u8?"))
+            {
+                return await GetActualSegmentUrlsAsync(targetUrl, http);
+            }
+
+            // Otherwise, we reached the segment level; resolve all segment URLs in this playlist
+            return lines.Select(line => ResolveAbsolute(m3u8Url, line)).ToList();
+        }
+
+        private static string ResolveAbsolute(string baseUrl, string maybeRelative) =>
+            Uri.TryCreate(maybeRelative, UriKind.Absolute, out var abs)
+                ? abs.ToString()
+                : new Uri(new Uri(baseUrl), maybeRelative).ToString();
+
+        public async Task<bool> IsHlsStreamByContentAsync(string url)
+        {
+            using var client = new HttpClient();
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+
+            // Request only the first 200 bytes
+            request.Headers.Range = new RangeHeaderValue(0, 200);
+
+            try
+            {
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                if (!response.IsSuccessStatusCode) return false;
+
+                using var stream = await response.Content.ReadAsStreamAsync();
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                string headerContent = await reader.ReadToEndAsync();
+
+                // Check for HLS m3u8 header tag
+                return headerContent.StartsWith("#EXTM3U", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private async void OpenButton_Click(object sender, RoutedEventArgs e)
         {
             var url = UrlTextBox.Text?.Trim();
             if (string.IsNullOrWhiteSpace(url))
                 return;
 
-            _downloader.Cancel();
+            // Cancel any ongoing download for a previous URL
+            _downloader?.Cancel();
             _currentUrl = url;
+
+            bool isHLS = await IsHlsStreamByContentAsync(url);
+
+            if (isHLS)
+            {
+                //using var http = new HttpClient();
+                //url = await GetRealMediaUrlAsync(url, http);
+
+                //var urls = await GetActualSegmentUrlsAsync(url, http);
+
+                _downloader = new HlsDownloader( _cache);
+                _downloader.ProgressChanged += OnDownloadProgress;
+                _downloader.Completed += OnDownloadCompleted;
+                _downloader.Failed += OnDownloadFailed;
+
+            }
+            else
+            {
+                _downloader = new BackgroundVideoDownloader(_cache);
+                _downloader.ProgressChanged += OnDownloadProgress;
+                _downloader.Completed += OnDownloadCompleted;
+                _downloader.Failed += OnDownloadFailed;
+            }
 
             // If the video is already fully retained locally, play it directly.
             if (_cache.IsFullyDownloaded(url))
@@ -111,7 +194,7 @@ namespace FlyLeafWithDownload
         }
 
         private void OnDownloadProgress(object? sender, double percentage)
-            => Dispatcher.BeginInvoke(() => SetStatus($"Downloading... {percentage:0.0}%"));
+            => Dispatcher.BeginInvoke(() => SetStatus($"Downloading... {percentage:0.00}%"));
 
         private void OnDownloadCompleted(object? sender, string localPath)
             => Dispatcher.BeginInvoke(async () => await SwitchToLocalFileAsync(localPath));

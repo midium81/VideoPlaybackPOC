@@ -7,7 +7,7 @@ namespace FlyLeafWithDownload.Download
     /// Background download of the video using bezzad/Downloader.
     /// Downloads to a *.part file and atomically promotes it to the final cached file.
     /// </summary>
-    public sealed class BackgroundVideoDownloader : IDisposable
+    public sealed class BackgroundVideoDownloader : IDisposable, IDownloader
     {
         private readonly Cache.VideoCache _cache;
         private DownloadService? _service;
@@ -35,6 +35,7 @@ namespace FlyLeafWithDownload.Download
                 ParallelDownload = true,
                 MaximumBytesPerSecond = 0,
                 BufferBlockSize = 8 * 1024,
+                EnableAutoResumeDownload = true,
                 MaxTryAgainOnFailure = 3,
                 ReserveStorageSpaceBeforeStartingDownload = true
             };
